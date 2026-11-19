@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const axios = require('axios');
+const { providerSymbol } = require('../services/market.cjs');
 
 const API_BASE = 'https://www.alphavantage.co/query';
 const TIMEOUT_MS = 10000;
@@ -27,7 +28,7 @@ router.get('/:symbol', async (req, res) => {
     const response = await axios.get(API_BASE, {
       params: {
         function: 'TIME_SERIES_DAILY',
-        symbol,
+        symbol: providerSymbol(symbol),
         apikey: apiKey,
       },
       timeout: TIMEOUT_MS,

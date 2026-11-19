@@ -1,3 +1,5 @@
 node_modules/
 .env
 watchlist.db
+watchlist.db-wal
+watchlist.db-shm

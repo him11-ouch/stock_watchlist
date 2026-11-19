@@ -3,7 +3,8 @@
   "version": "1.0.0",
   "main": "server.cjs",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node --test",
+    "watchlist": "node cli.cjs",
     "start": "node server.cjs",
     "dev": "nodemon server.cjs"
   },

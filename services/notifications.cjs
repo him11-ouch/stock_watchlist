@@ -21,7 +21,7 @@ async function fetchSymbol(symbol) {
 function notifyClose(data) {
   const price = Number(data.price);
   const priceStr = Number.isFinite(price) ? price.toFixed(2) : data.price;
-  const message = `Close: $${priceStr} • Date: ${data.date || 'n/a'}`;
+  const message = `Close: $${priceStr} on ${data.date || 'n/a'}`;
 
   notifier.notify(
     {

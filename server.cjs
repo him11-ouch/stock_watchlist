@@ -54,6 +54,6 @@ app.use((err, req, res, _next) => {
 
 startScheduler();
 
-app.listen(PORT, () => {
-  console.log(`Server is running on http://localhost:${PORT}`);
+const server = app.listen(PORT, process.env.WATCHLIST_HOST, () => {
+  console.log(`Server is running on http://localhost:${server.address().port}`);
 });
