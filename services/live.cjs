@@ -1,5 +1,5 @@
 const { setTimeout: delay } = require('node:timers/promises');
-const { equityChartLayout, pointCaption, openingEquity, changeSinceStart } = require('./equity-chart.cjs');
+const { equityChartLayout, pointCaption, openingEquity, changeSinceStart, todaysPnl, trendRanges } = require('./equity-chart.cjs');
 const { money } = require('./portfolio.cjs');
 const { priceLabel, quoteTime } = require('./dashboard.cjs');
 
@@ -47,14 +47,15 @@ function equityHeading(view, columns, rows, styled, large) {
   return [bold('TOTAL EQUITY'), bold(amount)];
 }
 
-function liveLayout(view, history, columns = 80, { rows = 24, styled = false, details = false, loading = false, inspectable = false } = {}) {
+function liveLayout(view, history, columns = 80, { rows = 24, styled = false, details = false, loading = false, inspectable = false,
+  range = trendRanges[0], menuIndex = -1, asOf } = {}) {
   const amount = value => value == null ? 'unavailable' : money(value, view.currency);
-  if (loading && !history.length) return { lines: [styled ? '  \x1b[1mTOTAL EQUITY\x1b[0m' : '  TOTAL EQUITY', '', '  Checking prices…'], plot: null };
-  let plot = null;
+  let plot = null, selector = null;
   const lines = equityHeading(view, columns, rows, styled, !details);
   const headingHeight = lines.length;
   if (Number.isFinite(view.equity)) lines.push(changeSinceStart(view, history));
-  else if (!details) lines.push('Type details to see which prices are missing.');
+  else if (!details && !loading) lines.push('Type details to see which prices are missing.');
+  lines.push(loading ? "Today's P&L  Checking prices…" : todaysPnl(view, history));
   lines.push('');
   if (details) {
     lines.push('HOLDINGS   Shares × price = market value');
@@ -71,18 +72,27 @@ function liveLayout(view, history, columns = 80, { rows = 24, styled = false, de
     for (const fx of new Map(view.positions.filter(p => p.fx).map(p => [p.fx.from, p.fx])).values()) {
       lines.push(`FX  1 ${fx.from} = ${fx.rate} ${view.currency}  ${quoteTime(fx.asOf)}  ${fx.source || ''}`.trimEnd());
     }
-  } else if (history.length || Number.isFinite(view.equity)) {
-    const plotRows = Math.min(8, Math.max(2, rows - 17 - Number(inspectable)));
-    const chart = equityChartLayout(view, history, columns - 2, { compact: true, rows: plotRows, inspectable });
-    if (chart.plot) plot = { ...chart.plot, left: chart.plot.left + 2, top: chart.plot.top + lines.length };
-    lines.push(...chart.lines);
+  } else {
+    const prefix = 'EQUITY TREND  ';
+    const button = `[ ${range.label} ${menuIndex < 0 ? '▾' : '▴'} ]`;
+    selector = { top: lines.length, left: 2 + prefix.length, width: button.length };
+    lines.push(prefix + button + (menuIndex < 0 ? '  Type range to choose' : ''));
+    if (menuIndex >= 0) {
+      trendRanges.forEach((option, i) => lines.push(' '.repeat(prefix.length) +
+        `${menuIndex === i ? '›' : ' '} ${i + 1}  ${option.label}`));
+    } else {
+      const plotRows = Math.max(2, Math.min(Math.round(rows / 3), rows - 18 - Number(inspectable)));
+      const chart = equityChartLayout(view, history, columns - 2, { compact: true, rows: plotRows, inspectable, range, asOf });
+      if (chart.plot) plot = { ...chart.plot, left: chart.plot.left + 2, top: chart.plot.top + lines.length };
+      lines.push(...chart.lines);
+    }
   }
   const last = view.recorded_at || view.recordedAt;
   const checked = last ? quoteTime(last, true) : view.date;
   lines.push('', `Cash  ${amount(view.cash)}${loading ? '' : '    Holdings  ' + view.positions.length}`,
     loading ? (history.length ? `Last saved  ${checked}    Checking for newer prices…` : 'Checking for prices…')
       : `Last check  ${checked}    Refreshes here every 60s`);
-  return { lines: lines.map(line => line ? '  ' + line : ''), plot, currency: view.currency,
+  return { lines: lines.map(line => line ? '  ' + line : ''), plot, selector, currency: view.currency,
     heading: { height: headingHeight, columns, rows, styled, startingEquity: openingEquity(view, history) } };
 }
 
@@ -92,7 +102,7 @@ function liveFrame(...args) {
 
 function inspectedLines(frame, index) {
   const { plot } = frame;
-  const sample = plot?.samples[index];
+  const sample = plot?.targets[index];
   if (!sample) return frame.lines;
   const lines = [...frame.lines];
   const { height, columns, rows, styled, startingEquity } = frame.heading;

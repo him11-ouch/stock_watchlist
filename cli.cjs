@@ -1,5 +1,6 @@
 require('dotenv').config({ quiet: true });
-const { createInterface } = require('node:readline');
+const { createInterface, emitKeypressEvents } = require('node:readline');
+const { PassThrough } = require('node:stream');
 const { setTimeout: delay } = require('node:timers/promises');
 const db = require('./db.cjs');
 const market = require('./services/market.cjs');
@@ -9,7 +10,7 @@ const account = require('./services/account.cjs');
 const { editProfile } = require('./services/profile-editor.cjs');
 const { ticker, quantity } = account;
 const { buildDashboard, renderDashboard } = require('./services/dashboard.cjs');
-const { equityChart } = require('./services/equity-chart.cjs');
+const { equityChart, trendRanges } = require('./services/equity-chart.cjs');
 const { liveLayout, inspectedLines, pollLive } = require('./services/live.cjs');
 const { pointAt } = require('./services/terminal-plot.cjs');
 const { TerminalInput, mouseOn, mouseOff } = require('./services/terminal-input.cjs');
@@ -309,6 +310,42 @@ async function main() {
     const control = new AbortController();
     let details = false, tracking = false, frame, selected = -1, visibleRows = 0;
     let pointer, refresh;
+    let range = trendRanges[0], menuIndex = -1;
+    const menuKeys = new PassThrough();
+    function showMenu(index) {
+      menuIndex = index;
+      pointer = null;
+      selected = -1;
+      if (redraw) keys.keyTarget = index >= 0 ? menuKeys : null;
+      refresh();
+      terminal?.prompt(true);
+    }
+    function chooseRange(index) {
+      range = trendRanges[index];
+      showMenu(-1);
+    }
+    emitKeypressEvents(menuKeys);
+    menuKeys.on('keypress', (value, key) => {
+      if (menuIndex < 0 || !key) return;
+      if (key.ctrl && ['c', 'd'].includes(key.name)) { terminal.close(); return; }
+      if (key.name === 'escape') showMenu(-1);
+      else if (key.name === 'return' || key.name === 'enter') chooseRange(menuIndex);
+      else if (key.name === 'up') showMenu(Math.max(0, menuIndex - 1));
+      else if (key.name === 'down') showMenu(Math.min(trendRanges.length - 1, menuIndex + 1));
+      else if (/^[1-6]$/.test(value)) showMenu(Number(value) - 1);
+    });
+    function click(column, row) {
+      const selector = frame?.selector;
+      if (!tracking || !selector || row >= visibleRows) return;
+      const x = column - selector.left, y = row - selector.top;
+      if (y === 0 && x >= 0 && x < selector.width) {
+        showMenu(menuIndex < 0 ? trendRanges.indexOf(range) : -1);
+      } else if (menuIndex >= 0) {
+        const option = trendRanges[y - 1];
+        if (option && x >= 0 && x < option.label.length + 5) chooseRange(y - 1);
+        else showMenu(-1);
+      }
+    }
     function track(enable) {
       if (redraw && tracking !== enable) process.stdout.write(enable ? mouseOn : mouseOff);
       tracking = enable;
@@ -330,17 +367,18 @@ async function main() {
       if (update) process.stdout.write('\x1b7' + update + '\x1b8');
     }
     function move(column, row) {
-      if (!tracking) return;
+      if (!tracking || menuIndex >= 0) return;
       pointer = { column, row };
       select(row < visibleRows ? pointAt(frame.plot, column, row) : -1);
     }
     function navigate(_, key) {
-      if (!tracking || terminal?.line || !key || key.ctrl || key.shift) return;
+      if (!tracking || !frame?.plot || terminal?.line || !key || key.ctrl || key.shift) return;
       if (key.name === 'escape') { pointer = null; select(-1); return; }
       if (key.meta || !['left', 'right'].includes(key.name)) return;
       pointer = null;
       const end = frame.plot.samples.length - 1;
-      select(Math.max(0, Math.min(end, (selected < 0 ? end : selected) + (key.name === 'left' ? -1 : 1))));
+      const current = frame.plot.targets[selected < 0 ? end : selected];
+      select(Math.max(0, Math.min(end, key.name === 'left' ? current.leftIndex : current.rightIndex)));
     }
     const resize = () => { refresh?.(); terminal?.prompt(true); };
     const close = () => terminal?.close();
@@ -351,7 +389,9 @@ async function main() {
       if (visible.length < lines.length) visible[height - 1] = '  Type dashboard for the full breakdown.';
       if (redraw) process.stdout.write('\x1b[H\x1b[2J');
       const hint = details ? 'summary  Equity graph' : 'details  Holdings and FX';
-      process.stdout.write([...visible, '', `  ${hint}     Enter  Pause and return to commands`].map(fit).join('\n') + '\n');
+      const footer = menuIndex < 0 ? `${hint}     Enter  Pause and return to commands` :
+        (redraw ? '↑ ↓  Choose range     Enter  Apply     Esc  Cancel' : 'Enter a range number, or cancel');
+      process.stdout.write([...visible, '', '  ' + footer].map(fit).join('\n') + '\n');
     }
     if (redraw) process.stdout.write('\x1b[?1049h');
     try {
@@ -359,21 +399,24 @@ async function main() {
       const pending = { currency: profile.currency, date: new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Toronto' }).format(now),
         recordedAt: now.toISOString(), equity: null };
       let history = account.equityHistory(pending);
-      let current = { ...pending, cash: profile.cash, ...history.at(-1), positions: [], startingEquity: profile.starting_equity };
+      const saved = history.at(-1);
+      let current = { ...(saved ?? pending), cash: saved ? saved.cash : profile.cash, positions: [], startingEquity: profile.starting_equity };
       let loading = true;
       function display(message) {
-        const previous = frame?.plot?.samples[selected]?.point;
+        const previous = frame?.plot?.targets[selected]?.point;
         frame = liveLayout(current, history, process.stdout.columns, { rows: process.stdout.rows || 24,
-          styled: redraw, details, loading, inspectable: redraw });
+          styled: redraw, details, loading, inspectable: redraw, range, menuIndex,
+          asOf: loading ? pending.recordedAt : current.recordedAt });
         if (message) frame.lines.push(message);
         selected = pointer ? pointAt(frame.plot, pointer.column, pointer.row) :
           (previous && frame.plot ? frame.plot.samples.findIndex(({ point }) => point.time === previous.time && point.equity === previous.equity) : -1);
         paint(inspectedLines(frame, selected));
-        track(Boolean(frame.plot && frame.plot.top < visibleRows));
+        track(Boolean(frame.selector && frame.selector.top < visibleRows));
       }
       refresh = display;
       if (redraw) {
         keys.on('pointer', move);
+        keys.on('click', click);
         keys.on('keypress', navigate);
         process.stdout.on('resize', resize);
         for (const signal of ['SIGHUP', 'SIGTERM', 'SIGINT']) process.once(signal, close);
@@ -383,6 +426,15 @@ async function main() {
         for (;;) {
           const line = await read('live> ');
           const command = line?.trim().toLowerCase();
+          if (command === 'range' && !details) {
+            showMenu(trendRanges.indexOf(range));
+            continue;
+          }
+          if (menuIndex >= 0 && line != null) {
+            if (command === 'cancel') showMenu(-1);
+            else if (/^[1-6]$/.test(command)) chooseRange(Number(command) - 1);
+            continue;
+          }
           if (command !== 'details' && command !== 'summary') return line;
           details = command === 'details';
           pointer = null;
@@ -408,9 +460,12 @@ async function main() {
       return (await Promise.race([next, updating])) ?? 'quit';
     } finally {
       control.abort();
+      menuKeys.destroy();
       if (redraw) {
+        keys.keyTarget = null;
         track(false);
         keys.off('pointer', move);
+        keys.off('click', click);
         keys.off('keypress', navigate);
         process.stdout.off('resize', resize);
         for (const signal of ['SIGHUP', 'SIGTERM', 'SIGINT']) process.off(signal, close);

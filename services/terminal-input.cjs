@@ -14,10 +14,16 @@ class TerminalInput extends Transform {
   get isRaw() { return this.tty.isRaw; }
   setRawMode(mode) { return this.tty.setRawMode(mode); }
 
+  sendKeys(bytes) {
+    if (this.keyTarget) this.keyTarget.write(bytes);
+    else this.push(bytes);
+  }
+
   pointer(button, x, y) {
     const motion = (button & 32) !== 0;
     if (button < 64 && (motion || (button & 3) === 0) && x > 0 && y > 0) {
       this.emit('pointer', x - 1, y - 1);
+      if (!motion && (button & 3) === 0) this.emit('click', x - 1, y - 1);
     }
   }
 
@@ -30,7 +36,7 @@ class TerminalInput extends Transform {
     while (offset < data.length) {
       const start = data.indexOf('\x1b', offset);
       const end = start === -1 ? data.length : start;
-      if (end > offset) this.push(Buffer.from(data.slice(offset, end), 'latin1'));
+      if (end > offset) this.sendKeys(Buffer.from(data.slice(offset, end), 'latin1'));
       if (start === -1) break;
       const rest = data.slice(start);
       const sgr = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])/.exec(rest);
@@ -46,7 +52,7 @@ class TerminalInput extends Transform {
         if (rest.length <= 2) this.escapeTimer = setTimeout(() => this.flushEscape(), 80);
         break;
       } else {
-        this.push(Buffer.from([27]));
+        this.sendKeys(Buffer.from([27]));
         offset = start + 1;
       }
     }
@@ -54,7 +60,7 @@ class TerminalInput extends Transform {
   }
 
   flushEscape() {
-    if (this.pending.length <= 2 && this.pending) this.push(Buffer.from(this.pending, 'latin1'));
+    if (this.pending.length <= 2 && this.pending) this.sendKeys(Buffer.from(this.pending, 'latin1'));
     this.pending = '';
   }
 

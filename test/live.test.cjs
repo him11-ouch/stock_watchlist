@@ -2,12 +2,115 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { setTimeout: delay } = require('node:timers/promises');
 const { liveFrame, liveLayout, inspectedLines, pollLive } = require('../services/live.cjs');
+const { todaysPnl, trendRanges } = require('../services/equity-chart.cjs');
 const { pointAt } = require('../services/terminal-plot.cjs');
 const { TerminalInput } = require('../services/terminal-input.cjs');
 const { buildDashboard } = require('../services/dashboard.cjs');
 
 process.env.WATCHLIST_DB = ':memory:';
 const account = require('../services/account.cjs');
+
+test('each live range shows its saved readings and handles stale and empty windows', () => {
+  const now = Date.parse('2026-11-19T21:00:00Z');
+  const history = [9000, 3000, 480, 80, 18, 1, 0].map((hours, i) => {
+    const stamp = new Date(now - hours * 3600000).toISOString();
+    return { recorded_at: stamp, date: stamp.slice(0, 10), equity: 100 + i, cash: 10, currency: 'CAD' };
+  });
+  const view = { ...history.at(-1), positions: [] };
+  for (const [i, range] of trendRanges.entries()) {
+    const frame = liveLayout(view, history, 80, { range, inspectable: true });
+    assert.ok(frame.lines[frame.selector.top].includes(`[ ${range.label} ▾ ]`));
+    assert.equal(frame.plot.samples[0].point.equity, 105 - i);
+    assert.equal(frame.plot.samples.at(-1).point.equity, 106);
+  }
+  const incomplete = { ...view, equity: null };
+  const single = liveFrame(incomplete, history.slice(-1), 80).join('\n');
+  assert.match(single, /One reading in this period/);
+  const stale = liveFrame(incomplete, history.slice(0, 2), 80).join('\n');
+  assert.match(stale, /No readings in this period/);
+  const menu = liveLayout(incomplete, [], 80, { menuIndex: 4 });
+  assert.ok(menu.selector);
+  assert.match(menu.lines.join('\n'), /› 5  Past year/);
+});
+
+test('live ranges place sparse readings on the selected time axis at different terminal widths', () => {
+  const date = '2026-11-19';
+  const history = [
+    ['14:10', 1824.19], ['21:12', 1802.75], ['23:02', 1772.87], ['23:51', 1772.87],
+  ].map(([time, equity]) => ({ date, recorded_at: `${date}T${time}:00Z`, currency: 'CAD', cash: 1, equity }));
+  const view = { ...history.at(-1), positions: [] };
+  for (const columns of [64, 210]) {
+    const layout = (range, readings = history) => liveLayout(view, readings, columns, { rows: 54, range, inspectable: true });
+    const hour = layout(trendRanges[0]).plot;
+    const width = hour.cells[0].length;
+    assert.equal(hour.left + width, columns - 1);
+    assert.equal(hour.height, 18);
+    assert.ok(hour.cells.every(row => row[Math.floor(width / 2)] === 0));
+    const starts = {};
+    for (const range of trendRanges.slice(1)) {
+      const frame = layout(range);
+      const { plot } = frame;
+      assert.equal(plot.left, hour.left);
+      assert.equal(plot.cells[0].length, width);
+      assert.equal(plot.height, hour.height);
+      assert.deepEqual(plot.samples.map(s => s.point.recorded_at), history.map(s => s.recorded_at));
+      const start = plot.samples[0].column;
+      starts[range.key] = start;
+      assert.equal(plot.samples.at(-1).column, width - 1);
+      for (let x = 0; x < width; x++) assert.equal(plot.cells.some(row => row[x]), x >= start);
+      assert.match(frame.lines.join('\n'), /connects available readings across gaps/);
+      assert.ok(frame.lines[plot.top + plot.height].length < columns);
+    }
+    assert.equal(starts.all, 0);
+    assert.ok(starts.all < starts.day && starts.day < starts.week && starts.week < starts.month);
+    assert.equal(starts.year, width - 1);
+    const single = layout(trendRanges[1], [view]).plot;
+    assert.equal(single.left + single.cells[0].length, columns - 1);
+    assert.equal(single.samples.length, 1);
+    assert.equal(single.cells.reduce((total, row) => total + row.filter(Boolean).length, 0), 1);
+  }
+});
+
+test('month and year plots use their own dates and equity history, even when the latest reading is stale', () => {
+  const history = [
+    ['2025-12-01', 1500], ['2026-08-17', 2500], ['2026-11-01', 2200], ['2026-11-15', 1747],
+  ].map(([date, equity]) => ({ date, recorded_at: date + 'T18:00:00Z', currency: 'CAD', cash: 1, equity }));
+  const view = { ...history.at(-1), positions: [] };
+  // In Toronto this is still November 19. The chart ends four days after the last reading.
+  const asOf = '2026-11-20T01:00:00Z';
+  const layout = key => liveLayout(view, history, 160, { asOf, inspectable: true, range: trendRanges.find(r => r.key === key) });
+  const month = layout('month'), year = layout('year');
+  for (const [frame, expectedStart, balances] of [
+    [month, '2026-10-20', [2200, 1747]], [year, '2025-11-19', [1500, 2500, 2200, 1747]],
+  ]) {
+    const { plot, lines } = frame;
+    const axis = lines[plot.top + plot.height];
+    assert.ok(axis.includes(expectedStart) && axis.endsWith('2026-11-19'));
+    assert.deepEqual(plot.samples.map(s => s.point.equity), balances);
+    assert.ok(plot.samples[0].column > 0);
+    assert.ok(plot.cells.every(row => !row[0] && !row.at(-1)));
+  }
+  assert.match(month.lines.join('\n'), /First reading in this period\s+2026-11-01/);
+  assert.ok(year.plot.samples.at(-2).column > month.plot.samples[0].column);
+  assert.ok(year.plot.samples.at(-1).column > month.plot.samples.at(-1).column);
+  assert.equal(year.plot.samples[1].row, 0);
+  assert.equal(month.plot.samples[0].row, 0);
+});
+
+test('daily P&L uses Eastern dates, removes funding, and includes trading gains', () => {
+  const row = (date, time, equity, key, activity) => ({ date, recorded_at: time, currency: 'CAD', equity, composition_key: key, activity });
+  const prior = row('2026-11-18', '2026-11-19T02:00:00Z', 1000, 'opening');
+  const deposit = row('2026-11-19', '2026-11-19T15:00:00Z', 2010, 'funded', 'Deposit CAD\u00a01,000.00');
+  const trade = row('2026-11-19', '2026-11-19T16:00:00Z', 2030, 'traded', 'Buy 1 ABC at 10 per share');
+  const latest = row('2026-11-19', '2026-11-20T02:00:00Z', 1980, 'latest', 'Withdraw CAD\u00a050.00');
+  const history = [prior, deposit, trade, latest];
+  const pnl = todaysPnl(latest, history).replaceAll('\u00a0', ' ');
+  assert.match(pnl, /\+CAD 30\.00 \(\+3\.00%\) since 2026-11-18 21:00:00 ET/);
+  assert.match(todaysPnl(latest, history.slice(1)), /\+CAD\s20\.00.*since first reading today/);
+  assert.match(todaysPnl(latest, [latest]), /awaits a second reading/);
+  assert.match(todaysPnl({ ...latest, equity: null }, history), /awaits a complete valuation/);
+  assert.match(todaysPnl({ ...latest, activity: 'Profile edited' }, history.slice(0, -1)), /unavailable/);
+});
 
 test('the live graph records a flat minute and then a price move, using dated intraday quotes', async () => {
   const control = new AbortController();
@@ -38,7 +141,7 @@ test('the live graph records a flat minute and then a price move, using dated in
   assert.match(frames[0], /Unchanged since your CAD 32.00 start/);
   assert.doesNotMatch(frames.join('\n'), /Latest CAD/);
   assert.match(frames[1], /Steady │/);
-  assert.match(frames[1], /●[\u2801-\u28ff]+●/);
+  assert.match(frames[1], /Steady │ +●●$/m);
   assert.match(frames[2], /TOTAL EQUITY\n  CAD 34.00/);
   assert.match(frames[2], /High CAD 34\.00 │[^\n]*●/);
   assert.match(frames[2], /Low CAD 32\.00 │/);
@@ -71,12 +174,62 @@ test('hover shows the equity and time of the plotted sample, including estimates
   assert.match(inspectedLines(frame, 0)[0], /TOTAL EQUITY\s+CAD\s30\.00/);
   const blankRow = plot.cells.findIndex(row => !row[plot.samples[1].column]);
   assert.notEqual(blankRow, -1);
-  assert.equal(pointAt(plot, plot.left + plot.samples[1].column, plot.top + blankRow), -1);
+  const nearby = pointAt(plot, plot.left + plot.samples[1].column, plot.top + blankRow);
+  assert.equal(plot.targets[nearby].column, plot.samples[1].column);
+  const gap = Math.floor((plot.samples[1].column + plot.samples[2].column) / 2);
+  assert.equal(pointAt(plot, plot.left + gap, plot.top), -1);
   assert.equal(pointAt(plot, plot.left, plot.top - 1), -1);
-  assert.deepEqual(inspectedLines(frame, -1), frame.lines);
+  assert.equal(inspectedLines(frame, -1), frame.lines);
   const updated = liveLayout({ ...view, equity: 26 }, [record], 65, { inspectable: true, rows: 20 });
   assert.match(inspectedLines(updated, 0)[1], /CAD\s30\.00/);
   assert.match(inspectedLines(updated, -1)[1], /CAD\s26\.00/);
+});
+
+test('hover follows the equity line at each time column between readings', () => {
+  const first = { date: '2026-11-18', recorded_at: '2026-11-19T03:00:00Z', currency: 'CAD', cash: 10, equity: 100 };
+  const view = { date: '2026-11-19', recordedAt: '2026-11-19T07:00:00Z', currency: 'CAD', cash: 10, equity: 140, positions: [] };
+  const frame = liveLayout(view, [first], 100, { rows: 33, range: trendRanges.at(-1), inspectable: true });
+  const { plot } = frame;
+  const width = plot.cells[0].length;
+  let previousTime = -Infinity;
+  for (let x = 0; x < width; x++) {
+    const sample = plot.targets[pointAt(plot, plot.left + x, plot.top)];
+    assert.equal(sample.column, x);
+    assert.ok(plot.cells[sample.row][x]);
+    assert.ok(sample.point.time > previousTime);
+    previousTime = sample.point.time;
+  }
+  const middle = plot.left + Math.floor(width / 2);
+  const index = pointAt(plot, middle, plot.top + plot.height - 1);
+  const sample = plot.targets[index];
+  assert.equal(sample.point.time, Date.parse('2026-11-19T05:00:00Z'));
+  assert.equal(sample.point.equity, 120);
+  assert.equal(plot.samples[sample.leftIndex].point.equity, 100);
+  assert.equal(plot.samples[sample.rightIndex].point.equity, 140);
+  const lines = inspectedLines(frame, index);
+  assert.match(lines[1], /CAD\s120\.00/);
+  assert.match(lines[2], /Up CAD\s20\.00 \(20\.00%\)/);
+  assert.match(lines[plot.top - 1], /Interpolated at 2026-11-19 00:00:00 ET/);
+  assert.equal(lines[plot.top + sample.row][middle], '◆');
+});
+
+test('steep moves within one time column have distinct hover values down the line', () => {
+  const first = { date: '2026-11-19', recorded_at: '2026-11-19T18:00:00Z', currency: 'CAD', cash: 1, equity: 140 };
+  const view = { ...first, recorded_at: '2026-11-19T18:02:00Z', equity: 100, positions: [] };
+  const { plot } = liveLayout(view, [first], 100, { range: trendRanges.find(r => r.key === 'year'), inspectable: true });
+  const x = plot.left + plot.samples[0].column;
+  assert.equal(pointAt(plot, x - 1, plot.top), -1);
+  assert.equal(pointAt(plot, x, plot.top), 0);
+  assert.equal(pointAt(plot, x, plot.top + plot.height - 1), 1);
+  let previous = plot.samples[0].point;
+  for (let y = 1; y < plot.height - 1; y++) {
+    const { point, row } = plot.targets[pointAt(plot, x, plot.top + y)];
+    assert.equal(row, y);
+    assert.equal(point.interpolated, true);
+    assert.ok(point.time > previous.time && point.time < plot.samples[1].point.time);
+    assert.ok(point.equity < previous.equity && point.equity > view.equity);
+    previous = point;
+  }
 });
 
 test('fragmented mouse reports and keyboard input can share the live prompt', async () => {
